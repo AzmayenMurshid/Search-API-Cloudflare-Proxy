@@ -1,0 +1,6 @@
+name = "yanko-business-search-proxy"
+main = "src/worker.js"
+compatibility_date = "2025-11-16"
+
+[vars]
+ALLOWED_ORIGIN = "*"
