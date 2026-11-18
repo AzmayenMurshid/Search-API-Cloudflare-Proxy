@@ -111,45 +111,47 @@ const toItemArray = (payload) => {
   return [payload];
 };
 
-const normalizeResultItem = (item, fallbackCompany, fallbackState) => {
+const hasMeaningfulCompanyData = (item) => {
+  if (!item || typeof item !== 'object') {
+    return false;
+  }
+
+  const fields = [
+    item.name,
+    item.company,
+    item.company_name,
+    item.business_name,
+    item.legal_name,
+    item.file_number,
+    item.business_id,
+    item.uei,
+    item.duns,
+    item.business_address,
+    item.registered_agent_full_address
+  ];
+
+  return fields.some((value) => sanitizeText(value).length > 0);
+};
+
+const normalizeResultItem = (item, fallbackCompany) => {
   if (!item || typeof item !== 'object') {
     return {
       id: fallbackCompany,
       name: fallbackCompany || 'Unknown Business',
-      address: fallbackState,
-      industry: 'Business',
-      phone: '',
-      category: 'Business',
-      city: '',
-      state: fallbackState,
-      status: 'Active',
-      rating: '-',
-      icon: 'fa-building',
-      description: 'Business listing from SBA'
+      state: '',
+      status: ''
     };
   }
 
   const name = item.name || item.company || item.company_name || item.business_name || item.legal_name || fallbackCompany || 'Unknown Business';
-  const city = item.city || item.business_city || item.business_address_city || '';
-  const state = (item.state || item.business_state || item.business_address_state || item.entity_formation_state || fallbackState || '').toUpperCase();
-  const street = item.address || item.street || item.address_1 || item.business_address || item.registered_agent_full_address || '';
-  const zip = item.zip || item.zip_code || item.postal_code || '';
-  const industry = item.industry || item.naics_description || item.category || 'Business';
-  const status = item.status || item.is_the_active_or_dissolved_ || 'Active';
+  const state = sanitizeText(item.state || item.business_state || item.business_address_state || item.entity_formation_state).toUpperCase();
+  const status = sanitizeText(item.status || item.is_the_active_or_dissolved_).toUpperCase();
 
   return {
-    id: item.id || item.business_id || item.file_number || item.uei || item.duns || name,
+    id: item.id || item.business_id || item.file_number || name,
     name,
-    address: [street, city, state, zip].filter(Boolean).join(', '),
-    industry,
-    phone: item.phone || item.business_phone || '',
-    category: item.category || industry,
-    city,
     state,
-    status,
-    rating: item.rating || '-',
-    icon: item.icon || 'fa-building',
-    description: item.description || 'Business listing from SBA test API.'
+    status
   };
 };
 
@@ -157,7 +159,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const allowOrigin = env.ALLOWED_ORIGIN || '*';
-    const defaultState = sanitizeText(env.DEFAULT_STATE).toUpperCase();
+    const defaultState = '';
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -256,8 +258,10 @@ export default {
 
       const sourceItems = toItemArray(parsedPayload);
       const results = sourceItems
-        .map((item) => normalizeResultItem(item, company, state))
-        .filter((item) => companyMatchesQuery(item.name, company));
+        .filter((item) => hasMeaningfulCompanyData(item))
+        .map((item) => normalizeResultItem(item, company))
+        .filter((item) => companyMatchesQuery(item.name, company))
+        .filter((item) => item.state.length > 0 && item.status.length > 0);
 
       return jsonResponse({
         results,
