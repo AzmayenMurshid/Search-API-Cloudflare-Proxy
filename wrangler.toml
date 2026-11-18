@@ -4,3 +4,4 @@ compatibility_date = "2025-11-16"
 
 [vars]
 ALLOWED_ORIGIN = "*"
+DEFAULT_STATE = "FL"
