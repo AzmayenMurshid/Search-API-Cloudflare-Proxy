@@ -12,6 +12,15 @@ const jsonResponse = (body, status = 200, origin = '*') => new Response(JSON.str
 
 const sanitizeText = (value) => String(value || '').trim();
 
+const US_STATE_CODES = [
+  'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+  'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+  'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+  'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+  'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY',
+  'DC'
+];
+
 const normalizeForMatch = (value) => sanitizeText(value)
   .toLowerCase()
   .replace(/[^a-z0-9\s]/g, ' ')
@@ -155,6 +164,67 @@ const normalizeResultItem = (item, fallbackCompany) => {
   };
 };
 
+const buildUpstreamUrl = (company, stateCode) => {
+  const upstream = new URL('https://sbaexit.com/search_company23.php');
+  upstream.searchParams.set('company', company);
+  upstream.searchParams.set('state', stateCode);
+  return upstream.toString();
+};
+
+const fetchUpstreamPayload = async (upstreamUrl) => {
+  try {
+    const response = await fetch(upstreamUrl, {
+      headers: {
+        accept: 'application/json, text/plain, */*'
+      }
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+    const rawBody = await response.text();
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        contentType,
+        rawBody,
+        parsedPayload: null
+      };
+    }
+
+    let parsedPayload = null;
+    try {
+      parsedPayload = contentType.includes('application/json') ? JSON.parse(rawBody) : JSON.parse(rawBody);
+    } catch (_parseError) {
+      parsedPayload = rawBody;
+    }
+
+    return {
+      ok: true,
+      status: response.status,
+      contentType,
+      rawBody,
+      parsedPayload
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      contentType: '',
+      rawBody: sanitizeText(error && error.message),
+      parsedPayload: null
+    };
+  }
+};
+
+const collectSearchTargets = (state) => {
+  if (state) {
+    return [state];
+  }
+
+  return US_STATE_CODES;
+};
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -181,99 +251,85 @@ export default {
       return jsonResponse({ error: 'Query too short', message: 'Provide at least 3 characters.' }, 400, allowOrigin);
     }
 
-    if (!state) {
-      return jsonResponse({
-        error: 'State required',
-        message: 'Provide state as ?state=FL or include it in query as "Company Name - FL".'
-      }, 400, allowOrigin);
-    }
-
     const debugMode = url.searchParams.get('debug') === '1';
-    const upstream = new URL('https://sbaexit.com/search_company23.php');
-    upstream.searchParams.set('company', company);
-    if (state) {
-      upstream.searchParams.set('state', state);
-    }
-
-    const upstreamUrl = upstream.toString();
+    const searchTargets = collectSearchTargets(state);
+    const upstreamUrls = searchTargets.map((stateCode) => buildUpstreamUrl(company, stateCode));
     const startedAt = Date.now();
 
-    console.log(`[proxy] upstream request ${upstreamUrl}`);
+    console.log(`[proxy] upstream request count=${upstreamUrls.length} company=${company}`);
 
     try {
-      const upstreamResponse = await fetch(upstreamUrl, {
-        headers: {
-          accept: 'application/json, text/plain, */*'
-        }
-      });
-
+      const upstreamResults = await Promise.all(upstreamUrls.map((upstreamUrl) => fetchUpstreamPayload(upstreamUrl)));
       const durationMs = Date.now() - startedAt;
-      const contentType = upstreamResponse.headers.get('content-type') || '';
-      const rawBody = await upstreamResponse.text();
-      const preview = rawBody.slice(0, 500);
 
-      console.log(`[proxy] upstream response status=${upstreamResponse.status} durationMs=${durationMs} preview=${preview}`);
+      const failedResponses = upstreamResults.filter((result) => !result.ok);
+      const successfulResponses = upstreamResults.filter((result) => result.ok);
+      const debugPreviews = upstreamResults.map((result, index) => ({
+        state: searchTargets[index],
+        status: result.status,
+        responsePreview: result.rawBody.slice(0, 200)
+      }));
 
-      if (!upstreamResponse.ok) {
+      if (successfulResponses.length === 0) {
+        const firstFailed = failedResponses[0];
         return jsonResponse({
           error: 'Lookup unavailable',
           message: 'Upstream service did not respond successfully.',
           ...(debugMode ? {
             debug: {
-              upstreamUrl,
-              status: upstreamResponse.status,
+              upstreamUrls,
+              status: firstFailed ? firstFailed.status : 502,
               durationMs,
-              responsePreview: preview
+              responsePreview: firstFailed ? firstFailed.rawBody.slice(0, 500) : '',
+              failedCount: failedResponses.length,
+              upstreamSamples: debugPreviews
             }
           } : {})
         }, 502, allowOrigin);
       }
 
-      let parsedPayload = null;
-      try {
-        parsedPayload = contentType.includes('application/json') ? JSON.parse(rawBody) : JSON.parse(rawBody);
-      } catch (_parseError) {
-        parsedPayload = rawBody;
-      }
+      const allSourceItems = successfulResponses.flatMap((result) => {
+        const payload = result.parsedPayload;
+        const upstreamError = Array.isArray(payload)
+          ? payload.find((entry) => entry && typeof entry === 'object' && entry.Error)
+          : (payload && typeof payload === 'object' && payload.Error ? payload : null);
 
-      const upstreamError = Array.isArray(parsedPayload)
-        ? parsedPayload.find((entry) => entry && typeof entry === 'object' && entry.Error)
-        : (parsedPayload && typeof parsedPayload === 'object' && parsedPayload.Error ? parsedPayload : null);
+        if (upstreamError) {
+          return [];
+        }
 
-      if (upstreamError) {
-        return jsonResponse({
-          error: 'Lookup unavailable',
-          message: String(upstreamError.Error),
-          ...(debugMode ? {
-            debug: {
-              upstreamUrl,
-              status: upstreamResponse.status,
-              durationMs,
-              contentType,
-              responsePreview: preview
-            }
-          } : {})
-        }, 400, allowOrigin);
-      }
+        return toItemArray(payload);
+      });
 
-      const sourceItems = toItemArray(parsedPayload);
-      const results = sourceItems
+      const sourceItems = allSourceItems;
+      const dedupeMap = new Map();
+      const normalized = sourceItems
         .filter((item) => hasMeaningfulCompanyData(item))
         .map((item) => normalizeResultItem(item, company))
         .filter((item) => companyMatchesQuery(item.name, company))
         .filter((item) => item.state.length > 0 && item.status.length > 0);
 
+      normalized.forEach((item) => {
+        const key = `${item.name}::${item.state}::${item.status}`.toUpperCase();
+        if (!dedupeMap.has(key)) {
+          dedupeMap.set(key, item);
+        }
+      });
+
+      const results = Array.from(dedupeMap.values());
+
       return jsonResponse({
         results,
         ...(debugMode ? {
           debug: {
-            upstreamUrl,
-            status: upstreamResponse.status,
+            upstreamUrls,
+            status: 200,
             durationMs,
-            contentType,
+            contentType: 'application/json; charset=utf-8',
             sourceCount: sourceItems.length,
             resultCount: results.length,
-            responsePreview: preview
+            failedCount: failedResponses.length,
+            upstreamSamples: debugPreviews.slice(0, 8)
           }
         } : {})
       }, 200, allowOrigin);
