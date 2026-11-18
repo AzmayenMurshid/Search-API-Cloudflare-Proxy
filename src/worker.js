@@ -12,6 +12,53 @@ const jsonResponse = (body, status = 200, origin = '*') => new Response(JSON.str
 
 const sanitizeText = (value) => String(value || '').trim();
 
+const normalizeForMatch = (value) => sanitizeText(value)
+  .toLowerCase()
+  .replace(/[^a-z0-9\s]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const COMPANY_STOP_WORDS = new Set([
+  'llc',
+  'inc',
+  'incorporated',
+  'corp',
+  'corporation',
+  'co',
+  'company',
+  'ltd',
+  'lp',
+  'llp',
+  'pllc',
+  'the',
+  'and',
+  'of'
+]);
+
+const extractMatchTokens = (value) => normalizeForMatch(value)
+  .split(' ')
+  .filter((token) => token.length >= 3 && !COMPANY_STOP_WORDS.has(token));
+
+const companyMatchesQuery = (companyName, query) => {
+  const normalizedName = normalizeForMatch(companyName);
+  const normalizedQuery = normalizeForMatch(query);
+
+  if (!normalizedName || !normalizedQuery) {
+    return false;
+  }
+
+  if (normalizedName.includes(normalizedQuery)) {
+    return true;
+  }
+
+  const queryTokens = extractMatchTokens(query);
+  if (queryTokens.length === 0) {
+    return normalizedName.includes(normalizedQuery);
+  }
+
+  return queryTokens.every((token) => normalizedName.includes(token));
+};
+
 const extractCompanyAndState = (searchParams, defaultState = '') => {
   const rawQuery = sanitizeText(searchParams.get('query'));
   const explicitCompany = sanitizeText(searchParams.get('company'));
@@ -208,7 +255,9 @@ export default {
       }
 
       const sourceItems = toItemArray(parsedPayload);
-      const results = sourceItems.map((item) => normalizeResultItem(item, company, state));
+      const results = sourceItems
+        .map((item) => normalizeResultItem(item, company, state))
+        .filter((item) => companyMatchesQuery(item.name, company));
 
       return jsonResponse({
         results,
@@ -218,6 +267,7 @@ export default {
             status: upstreamResponse.status,
             durationMs,
             contentType,
+            sourceCount: sourceItems.length,
             resultCount: results.length,
             responsePreview: preview
           }
