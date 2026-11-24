@@ -157,6 +157,14 @@ const extractCompanyName = (searchParams) => {
   return explicitCompany || rawQuery;
 };
 
+const resolveStateCode = (searchParams, env) => {
+  const requestedState = sanitizeText(searchParams.get('state')).toUpperCase();
+  const defaultState = sanitizeText(env && env.DEFAULT_STATE).toUpperCase();
+  const stateCode = requestedState || defaultState || 'FL';
+
+  return /^[A-Z]{2}$/.test(stateCode) ? stateCode : 'FL';
+};
+
 const toItemArray = (payload) => {
   if (Array.isArray(payload)) {
     return payload;
@@ -225,9 +233,10 @@ const normalizeResultItem = (item, fallbackCompany) => {
   };
 };
 
-const buildUpstreamUrl = (company) => {
-  const upstream = new URL('https://api.openbrewerydb.org/v1/breweries');
-  upstream.searchParams.set('by_name', company);
+const buildUpstreamUrl = (company, stateCode) => {
+  const upstream = new URL('https://sbaexit.com/search_company23.php');
+  upstream.searchParams.set('company', company);
+  upstream.searchParams.set('state', stateCode);
   return upstream.toString();
 };
 
@@ -301,7 +310,17 @@ export default {
       return jsonResponse({ error: 'Not found' }, 404, allowOrigin);
     }
 
+    console.log('[proxy] incoming request', {
+      method: request.method,
+      path: url.pathname,
+      query: sanitizeText(url.searchParams.get('query')),
+      company: sanitizeText(url.searchParams.get('company')),
+      state: sanitizeText(url.searchParams.get('state')),
+      debug: sanitizeText(url.searchParams.get('debug'))
+    });
+
     const company = extractCompanyName(url.searchParams);
+    const stateCode = resolveStateCode(url.searchParams, env);
     const queryValidation = validateIncomingQuery(company, queryGuardMode);
 
     if (queryValidation.reasons.length > 0) {
@@ -335,10 +354,10 @@ export default {
     }
 
     const debugMode = url.searchParams.get('debug') === '1';
-    const upstreamUrl = buildUpstreamUrl(validatedCompany);
+    const upstreamUrl = buildUpstreamUrl(validatedCompany, stateCode);
     const startedAt = Date.now();
 
-    console.log(`[proxy] upstream request company=${validatedCompany}`);
+    console.log(`[proxy] upstream request company=${validatedCompany} state=${stateCode}`);
 
     try {
       const upstreamResult = await fetchUpstreamPayload(upstreamUrl);
