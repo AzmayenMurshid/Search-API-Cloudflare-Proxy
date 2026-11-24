@@ -12,14 +12,61 @@ const jsonResponse = (body, status = 200, origin = '*') => new Response(JSON.str
 
 const sanitizeText = (value) => String(value || '').trim();
 
-const US_STATE_CODES = [
-  'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-  'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-  'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-  'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-  'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY',
-  'DC'
-];
+const QUERY_GUARD_MODES = new Set(['off', 'monitor', 'enforce']);
+const QUERY_MAX_LENGTH = 120;
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001F\u007F]/g;
+const CONTROL_CHAR_TEST_PATTERN = /[\u0000-\u001F\u007F]/;
+const UNSUPPORTED_QUERY_CHAR_PATTERN = /[^a-zA-Z0-9\s&'.,()\-/#]/;
+
+const summarizeForLog = (value) => sanitizeText(value)
+  .replace(CONTROL_CHAR_PATTERN, ' ')
+  .replace(/\s+/g, ' ')
+  .slice(0, 160);
+
+const resolveQueryGuardMode = (env) => {
+  const configuredMode = sanitizeText(env && env.QUERY_GUARD_MODE).toLowerCase();
+  return QUERY_GUARD_MODES.has(configuredMode) ? configuredMode : 'monitor';
+};
+
+const normalizeIncomingQuery = (value) => sanitizeText(value)
+  .replace(CONTROL_CHAR_PATTERN, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const validateIncomingQuery = (rawQuery, mode) => {
+  const initialValue = sanitizeText(rawQuery);
+  const normalizedValue = normalizeIncomingQuery(initialValue);
+  const truncatedValue = normalizedValue.slice(0, QUERY_MAX_LENGTH);
+
+  const hadControlChars = CONTROL_CHAR_TEST_PATTERN.test(initialValue);
+  const exceededMaxLength = normalizedValue.length > QUERY_MAX_LENGTH;
+  const hasUnsupportedChars = truncatedValue.length > 0 && UNSUPPORTED_QUERY_CHAR_PATTERN.test(truncatedValue);
+
+  const reasons = [];
+  if (hadControlChars) {
+    reasons.push('control_chars_removed');
+  }
+  if (exceededMaxLength) {
+    reasons.push('query_too_long');
+  }
+  if (hasUnsupportedChars) {
+    reasons.push('unsupported_characters');
+  }
+
+  const wouldBlock = hadControlChars || exceededMaxLength || hasUnsupportedChars;
+  const blocked = mode === 'enforce' && wouldBlock;
+
+  return {
+    normalizedQuery: truncatedValue,
+    reasons,
+    wouldBlock,
+    blocked,
+    logPreview: summarizeForLog(truncatedValue),
+    rawPreview: summarizeForLog(initialValue),
+    rawLength: initialValue.length,
+    normalizedLength: truncatedValue.length
+  };
+};
 
 const normalizeForMatch = (value) => sanitizeText(value)
   .toLowerCase()
@@ -56,44 +103,58 @@ const companyMatchesQuery = (companyName, query) => {
     return false;
   }
 
-  if (normalizedName.includes(normalizedQuery)) {
+  if (normalizedName.includes(normalizedQuery) || normalizedQuery.includes(normalizedName)) {
     return true;
   }
 
+  // Allow short prefixes such as "Haf" to match "Hafeed Inc".
+  if (normalizedQuery.length >= 3) {
+    const nameStartsWithQuery = normalizedName.startsWith(normalizedQuery);
+    const queryStartsWithName = normalizedName.length >= 3 && normalizedQuery.startsWith(normalizedName);
+    if (nameStartsWithQuery || queryStartsWithName) {
+      return true;
+    }
+  }
+
   const queryTokens = extractMatchTokens(query);
+  const nameTokens = extractMatchTokens(normalizedName);
   if (queryTokens.length === 0) {
     return normalizedName.includes(normalizedQuery);
   }
 
-  return queryTokens.every((token) => normalizedName.includes(token));
+  return queryTokens.some((queryToken) => nameTokens.some((nameToken) => {
+    if (nameToken.includes(queryToken) || queryToken.includes(nameToken)) {
+      return true;
+    }
+
+    // Small edit-distance tolerance handles nearby misspellings.
+    if (queryToken.length >= 4) {
+      const maxDistance = queryToken.length >= 7 ? 2 : 1;
+      let previousRow = Array.from({ length: nameToken.length + 1 }, (_, index) => index);
+
+      for (let i = 1; i <= queryToken.length; i += 1) {
+        const currentRow = [i];
+        for (let j = 1; j <= nameToken.length; j += 1) {
+          const insertCost = currentRow[j - 1] + 1;
+          const deleteCost = previousRow[j] + 1;
+          const substituteCost = previousRow[j - 1] + (queryToken[i - 1] === nameToken[j - 1] ? 0 : 1);
+          currentRow[j] = Math.min(insertCost, deleteCost, substituteCost);
+        }
+        previousRow = currentRow;
+      }
+
+      return previousRow[nameToken.length] <= maxDistance;
+    }
+
+    return false;
+  }));
 };
 
-const extractCompanyAndState = (searchParams, defaultState = '') => {
+const extractCompanyName = (searchParams) => {
   const rawQuery = sanitizeText(searchParams.get('query'));
   const explicitCompany = sanitizeText(searchParams.get('company'));
-  const explicitState = sanitizeText(searchParams.get('state')).toUpperCase();
 
-  if (explicitCompany) {
-    return {
-      company: explicitCompany,
-      state: /^[A-Z]{2}$/.test(explicitState) ? explicitState : ''
-    };
-  }
-
-  // Supports current module format: "Business Name - FL"
-  const stateSuffixMatch = rawQuery.match(/^(.*?)(?:\s*[-,]\s*|\s+)([A-Za-z]{2})$/);
-  if (stateSuffixMatch) {
-    const company = sanitizeText(stateSuffixMatch[1]);
-    const state = sanitizeText(stateSuffixMatch[2]).toUpperCase();
-    if (company && /^[A-Z]{2}$/.test(state)) {
-      return { company, state };
-    }
-  }
-
-  return {
-    company: rawQuery,
-    state: /^[A-Z]{2}$/.test(explicitState) ? explicitState : defaultState
-  };
+  return explicitCompany || rawQuery;
 };
 
 const toItemArray = (payload) => {
@@ -147,27 +208,23 @@ const normalizeResultItem = (item, fallbackCompany) => {
     return {
       id: fallbackCompany,
       name: fallbackCompany || 'Unknown Business',
-      state: '',
       status: ''
     };
   }
 
   const name = item.name || item.company || item.company_name || item.business_name || item.legal_name || fallbackCompany || 'Unknown Business';
-  const state = sanitizeText(item.state || item.business_state || item.business_address_state || item.entity_formation_state).toUpperCase();
   const status = sanitizeText(item.status || item.is_the_active_or_dissolved_).toUpperCase();
 
   return {
     id: item.id || item.business_id || item.file_number || name,
     name,
-    state,
     status
   };
 };
 
-const buildUpstreamUrl = (company, stateCode) => {
-  const upstream = new URL('https://sbaexit.com/search_company23.php');
+const buildUpstreamUrl = (company) => {
+  const upstream = new URL('https://api.openbrewerydb.org/v1/breweries');
   upstream.searchParams.set('company', company);
-  upstream.searchParams.set('state', stateCode);
   return upstream.toString();
 };
 
@@ -217,19 +274,11 @@ const fetchUpstreamPayload = async (upstreamUrl) => {
   }
 };
 
-const collectSearchTargets = (state) => {
-  if (state) {
-    return [state];
-  }
-
-  return US_STATE_CODES;
-};
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const allowOrigin = env.ALLOWED_ORIGIN || '*';
-    const defaultState = '';
+    const queryGuardMode = resolveQueryGuardMode(env);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -239,75 +288,100 @@ export default {
     }
 
     if (url.pathname === '/health') {
-      return jsonResponse({ ok: true, service: 'yanko-business-search-proxy' }, 200, allowOrigin);
+      return jsonResponse({ 
+        ok: true, 
+        service: 'yanko-business-search-proxy' 
+      }, 200, allowOrigin);
     }
 
     if (url.pathname !== '/api/business-search') {
       return jsonResponse({ error: 'Not found' }, 404, allowOrigin);
     }
 
-    const { company, state } = extractCompanyAndState(url.searchParams, defaultState);
-    if (!company || company.length < 3) {
-      return jsonResponse({ error: 'Query too short', message: 'Provide at least 3 characters.' }, 400, allowOrigin);
+    const company = extractCompanyName(url.searchParams);
+    const queryValidation = validateIncomingQuery(company, queryGuardMode);
+
+    if (queryValidation.reasons.length > 0) {
+      console.warn('[query-guard] input adjusted or flagged', {
+        mode: queryGuardMode,
+        wouldBlock: queryValidation.wouldBlock,
+        blocked: queryValidation.blocked,
+        reasons: queryValidation.reasons,
+        rawLength: queryValidation.rawLength,
+        normalizedLength: queryValidation.normalizedLength,
+        rawPreview: queryValidation.rawPreview,
+        normalizedPreview: queryValidation.logPreview
+      });
+    }
+
+    if (queryValidation.blocked) {
+      return jsonResponse({
+        error: 'Invalid query',
+        message: 'Search query was blocked by input validation. Remove special characters and shorten the query to 120 characters or less.',
+        code: 'QUERY_VALIDATION_FAILED',
+        details: queryValidation.reasons
+      }, 400, allowOrigin);
+    }
+
+    const validatedCompany = queryValidation.normalizedQuery;
+    if (!validatedCompany || validatedCompany.length < 3) {
+      return jsonResponse({ 
+        error: 'Query too short', 
+        message: 'Provide at least 3 characters.' 
+      }, 400, allowOrigin);
     }
 
     const debugMode = url.searchParams.get('debug') === '1';
-    const searchTargets = collectSearchTargets(state);
-    const upstreamUrls = searchTargets.map((stateCode) => buildUpstreamUrl(company, stateCode));
+    const upstreamUrl = buildUpstreamUrl(validatedCompany);
     const startedAt = Date.now();
 
-    console.log(`[proxy] upstream request count=${upstreamUrls.length} company=${company}`);
+    console.log(`[proxy] upstream request company=${validatedCompany}`);
 
     try {
-      const upstreamResults = await Promise.all(upstreamUrls.map((upstreamUrl) => fetchUpstreamPayload(upstreamUrl)));
+      const upstreamResult = await fetchUpstreamPayload(upstreamUrl);
       const durationMs = Date.now() - startedAt;
 
-      const failedResponses = upstreamResults.filter((result) => !result.ok);
-      const successfulResponses = upstreamResults.filter((result) => result.ok);
-      const debugPreviews = upstreamResults.map((result, index) => ({
-        state: searchTargets[index],
-        status: result.status,
-        responsePreview: result.rawBody.slice(0, 200)
-      }));
-
-      if (successfulResponses.length === 0) {
-        const firstFailed = failedResponses[0];
+      if (!upstreamResult.ok) {
         return jsonResponse({
           error: 'Lookup unavailable',
           message: 'Upstream service did not respond successfully.',
           ...(debugMode ? {
             debug: {
-              upstreamUrls,
-              status: firstFailed ? firstFailed.status : 502,
+              upstreamUrl,
+              status: upstreamResult.status,
               durationMs,
-              responsePreview: firstFailed ? firstFailed.rawBody.slice(0, 500) : '',
-              failedCount: failedResponses.length,
-              upstreamSamples: debugPreviews
+              responsePreview: upstreamResult.rawBody.slice(0, 500)
             }
           } : {})
         }, 502, allowOrigin);
       }
 
-      const allSourceItems = successfulResponses.flatMap((result) => {
-        const payload = result.parsedPayload;
-        const upstreamError = Array.isArray(payload)
-          ? payload.find((entry) => entry && typeof entry === 'object' && entry.Error)
-          : (payload && typeof payload === 'object' && payload.Error ? payload : null);
+      const payload = upstreamResult.parsedPayload;
+      const upstreamError = Array.isArray(payload)
+        ? payload.find((entry) => entry && typeof entry === 'object' && entry.Error)
+        : (payload && typeof payload === 'object' && payload.Error ? payload : null);
 
-        if (upstreamError) {
-          return [];
-        }
+      if (upstreamError) {
+        return jsonResponse({
+          error: 'Lookup unavailable',
+          message: 'Upstream service returned an error.',
+          ...(debugMode ? {
+            debug: {
+              upstreamUrl,
+              status: 502,
+              durationMs,
+              responsePreview: upstreamResult.rawBody.slice(0, 500)
+            }
+          } : {})
+        }, 502, allowOrigin);
+      }
 
-        return toItemArray(payload);
-      });
-
-      const sourceItems = allSourceItems;
+      const sourceItems = toItemArray(payload);
       const dedupeMap = new Map();
       const normalized = sourceItems
         .filter((item) => hasMeaningfulCompanyData(item))
-        .map((item) => normalizeResultItem(item, company))
-        .filter((item) => companyMatchesQuery(item.name, company))
-        .filter((item) => item.state.length > 0 && item.status.length > 0);
+        .map((item) => normalizeResultItem(item, validatedCompany))
+        .filter((item) => companyMatchesQuery(item.name, validatedCompany));
 
       normalized.forEach((item) => {
         const key = `${item.name}::${item.state}::${item.status}`.toUpperCase();
@@ -322,20 +396,21 @@ export default {
         results,
         ...(debugMode ? {
           debug: {
-            upstreamUrls,
+            upstreamUrl,
             status: 200,
             durationMs,
             contentType: 'application/json; charset=utf-8',
             sourceCount: sourceItems.length,
-            resultCount: results.length,
-            failedCount: failedResponses.length,
-            upstreamSamples: debugPreviews.slice(0, 8)
+            resultCount: results.length
           }
         } : {})
       }, 200, allowOrigin);
     } catch (error) {
       console.error('Cloudflare worker lookup error:', error);
-      return jsonResponse({ error: 'Lookup unavailable', message: 'The business lookup service is unavailable right now.' }, 502, allowOrigin);
+      return jsonResponse({ 
+        error: 'Lookup unavailable', 
+        message: 'The business lookup service is unavailable right now.' 
+      }, 502, allowOrigin);
     }
   }
 };
