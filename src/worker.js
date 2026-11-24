@@ -208,23 +208,26 @@ const normalizeResultItem = (item, fallbackCompany) => {
     return {
       id: fallbackCompany,
       name: fallbackCompany || 'Unknown Business',
+      state: '',
       status: ''
     };
   }
 
   const name = item.name || item.company || item.company_name || item.business_name || item.legal_name || fallbackCompany || 'Unknown Business';
-  const status = sanitizeText(item.status || item.is_the_active_or_dissolved_).toUpperCase();
+  const state = sanitizeText(item.state || item.state_province || item.region);
+  const status = sanitizeText(item.status || item.is_the_active_or_dissolved_ || item.brewery_type).toUpperCase();
 
   return {
     id: item.id || item.business_id || item.file_number || name,
     name,
+    state,
     status
   };
 };
 
 const buildUpstreamUrl = (company) => {
   const upstream = new URL('https://api.openbrewerydb.org/v1/breweries');
-  upstream.searchParams.set('company', company);
+  upstream.searchParams.set('by_name', company);
   return upstream.toString();
 };
 
